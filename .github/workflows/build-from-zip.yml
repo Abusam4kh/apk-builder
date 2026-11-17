@@ -1,0 +1,116 @@
+name: Build APK Builder from ZIP
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "apk_builder.zip"
+      - ".github/workflows/build-from-zip.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Extract and build APK Builder
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract project
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f apk_builder.zip || {
+            echo "ERROR: apk_builder.zip was not found in the repository root."
+            exit 1
+          }
+
+          mkdir -p unpacked app
+          unzip -q apk_builder.zip -d unpacked
+          rm -rf unpacked/__MACOSX
+
+          # Support ZIP files that contain one top-level project folder.
+          shopt -s dotglob
+          entries=(unpacked/*)
+          if [ "${#entries[@]}" -eq 1 ] && [ -d "${entries[0]}" ]; then
+            cp -R "${entries[0]}"/. app/
+          else
+            cp -R unpacked/. app/
+          fi
+
+          test -f app/pubspec.yaml || {
+            echo "ERROR: pubspec.yaml was not found after extracting the ZIP."
+            find app -maxdepth 3 -type f | head -80
+            exit 1
+          }
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate and patch the Android project
+        working-directory: app
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d android ]; then
+            flutter create --platforms=android --project-name apk_builder --org com.apkbuilder .
+          fi
+          python3 tool/patch_android.py
+
+      - name: Get packages
+        working-directory: app
+        run: flutter pub get
+
+      - name: Build release APK
+        working-directory: app
+        run: flutter build apk --release --dart-define=GH_CLIENT_ID=${{ vars.GH_CLIENT_ID }}
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk=app/build/app/outputs/flutter-apk/app-release.apk
+          test -f "$apk" || {
+            echo "ERROR: No APK was generated."
+            find app -type f -name "*.apk" -print
+            exit 1
+          }
+          size=$(stat -c%s "$apk")
+          if [ "$size" -lt 1000000 ]; then
+            echo "ERROR: APK is unexpectedly small ($size bytes)"
+            exit 1
+          fi
+          unzip -tq "$apk"
+          echo "Verified: $apk ($size bytes)"
+          cp "$apk" apk-builder.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: APK-Builder
+          path: apk-builder.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish release (easy download from phone)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" apk-builder.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "APK Builder #${{ github.run_number }}" \
+            --notes "Built from apk_builder.zip"
